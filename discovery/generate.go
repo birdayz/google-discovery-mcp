@@ -12,10 +12,11 @@ import (
 
 // GenerateOptions configures code generation.
 type GenerateOptions struct {
-	PackageName  string   // Go package name (default: "tools")
-	Methods      []string // Specific methods to generate (empty = all)
-	Prefix       string   // Tool name prefix (e.g., "youtube_")
-	StructPrefix string   // Struct name prefix (default: "API")
+	PackageName    string   // Go package name (default: "tools")
+	Methods        []string // Specific methods to generate (empty = all)
+	Prefix         string   // Tool name prefix (e.g., "youtube_")
+	StructPrefix   string   // Struct name prefix (default: "API")
+	GenerateSchema bool     // Generate schema types (request/response bodies)
 }
 
 // GenerateMCPTools generates Go code for MCP tools from a Discovery Document.
@@ -52,13 +53,22 @@ func GenerateMCPTools(doc *Document, opts GenerateOptions) (string, error) {
 		})
 	}
 
+	// Collect schemas needed by the methods
+	var schemasToGen []*SchemaInfo
+	if opts.GenerateSchema {
+		schemasToGen = collectSchemas(methodsToGenerate, doc.Schemas)
+	}
+
 	data := &TemplateData{
-		PackageName: opts.PackageName,
-		APIName:     doc.Name,
-		APITitle:    doc.Title,
-		APIVersion:  doc.Version,
-		Methods:     methodsToGenerate,
-		Schemas:     doc.Schemas,
+		PackageName:    opts.PackageName,
+		APIName:        doc.Name,
+		APITitle:       doc.Title,
+		APIVersion:     doc.Version,
+		Methods:        methodsToGenerate,
+		Schemas:        doc.Schemas,
+		SchemasToGen:   schemasToGen,
+		AllSchemas:     doc.Schemas,
+		GenerateSchema: opts.GenerateSchema,
 	}
 
 	var buf bytes.Buffer
@@ -78,12 +88,15 @@ func GenerateMCPTools(doc *Document, opts GenerateOptions) (string, error) {
 
 // TemplateData is passed to the code generation template.
 type TemplateData struct {
-	PackageName string
-	APIName     string
-	APITitle    string
-	APIVersion  string
-	Methods     []*MethodInfo
-	Schemas     map[string]*Schema
+	PackageName    string
+	APIName        string
+	APITitle       string
+	APIVersion     string
+	Methods        []*MethodInfo
+	Schemas        map[string]*Schema
+	SchemasToGen   []*SchemaInfo // Schemas to generate, in dependency order
+	AllSchemas     map[string]*Schema
+	GenerateSchema bool // Whether to generate schema types
 }
 
 // MethodInfo wraps a Method with generation helpers.
@@ -192,6 +205,147 @@ func (p *ParamInfo) SchemaDescription() string {
 	return desc
 }
 
+// SchemaInfo wraps a Schema with generation helpers.
+type SchemaInfo struct {
+	Name        string             // Schema name (e.g., "Video", "VideoStatus")
+	Schema      *Schema            // The schema definition
+	AllSchemas  map[string]*Schema // Reference to all schemas for resolving $ref
+	RequiredSet map[string]bool    // Set of required property names
+}
+
+// NewSchemaInfo creates a SchemaInfo from a schema.
+func NewSchemaInfo(name string, schema *Schema, allSchemas map[string]*Schema) *SchemaInfo {
+	requiredSet := make(map[string]bool)
+	if schema.Annotations != nil {
+		for _, req := range schema.Annotations.Required {
+			requiredSet[req] = true
+		}
+	}
+	return &SchemaInfo{
+		Name:        name,
+		Schema:      schema,
+		AllSchemas:  allSchemas,
+		RequiredSet: requiredSet,
+	}
+}
+
+// StructName returns the Go struct name for this schema.
+func (s *SchemaInfo) StructName() string {
+	return exportedName(s.Name)
+}
+
+// Description returns the schema description.
+func (s *SchemaInfo) Description() string {
+	return cleanDescription(s.Schema.Description)
+}
+
+// SortedProperties returns schema properties sorted by: required first, then alphabetically.
+func (s *SchemaInfo) SortedProperties() []*PropertyInfo {
+	var props []*PropertyInfo
+	for name, prop := range s.Schema.Properties {
+		required := s.RequiredSet[name] || prop.Required
+		props = append(props, &PropertyInfo{
+			Name:       name,
+			Property:   prop,
+			Required:   required,
+			AllSchemas: s.AllSchemas,
+		})
+	}
+	sort.Slice(props, func(i, j int) bool {
+		if props[i].Required != props[j].Required {
+			return props[i].Required
+		}
+		return props[i].Name < props[j].Name
+	})
+	return props
+}
+
+// PropertyInfo wraps a schema property with generation helpers.
+type PropertyInfo struct {
+	Name       string
+	Property   *Schema
+	Required   bool
+	AllSchemas map[string]*Schema
+}
+
+// FieldName returns the Go field name (exported).
+func (p *PropertyInfo) FieldName() string {
+	return exportedName(p.Name)
+}
+
+// JSONTag returns the json struct tag.
+func (p *PropertyInfo) JSONTag() string {
+	if p.Required {
+		return p.Name
+	}
+	return p.Name + ",omitempty"
+}
+
+// GoType returns the Go type for this property.
+func (p *PropertyInfo) GoType() string {
+	return p.resolveType(p.Property, !p.Required)
+}
+
+// resolveType resolves the Go type for a schema, handling refs, arrays, objects, etc.
+func (p *PropertyInfo) resolveType(schema *Schema, optional bool) string {
+	// Handle $ref
+	if schema.Ref != "" {
+		// Reference to another schema - use its exported name
+		refType := exportedName(schema.Ref)
+		// Check if the referenced schema is a simple type (wrapper)
+		if refSchema, ok := p.AllSchemas[schema.Ref]; ok {
+			if refSchema.Type != "" && refSchema.Type != "object" && refSchema.Type != "array" {
+				return scalarGoType(refSchema.Type, refSchema.Format, optional)
+			}
+		}
+		return "*" + refType
+	}
+
+	switch schema.Type {
+	case "array":
+		if schema.Items != nil {
+			elemType := p.resolveType(schema.Items, false) // array elements aren't individually optional
+			return "[]" + elemType
+		}
+		return "[]any"
+	case "object":
+		if schema.AdditionalProperties != nil {
+			valueType := p.resolveType(schema.AdditionalProperties, false)
+			return "map[string]" + valueType
+		}
+		// Inline object - use any since we can't generate anonymous structs well
+		return "map[string]any"
+	default:
+		return scalarGoType(schema.Type, schema.Format, optional)
+	}
+}
+
+// SchemaDescription returns the jsonschema description for this property.
+func (p *PropertyInfo) SchemaDescription() string {
+	desc := cleanDescription(p.Property.Description)
+
+	// Add enum values to description if present
+	if len(p.Property.Enum) > 0 {
+		enumStr := strings.Join(p.Property.Enum, ", ")
+		if len(desc) > 0 {
+			desc += " "
+		}
+		desc += "Values: " + enumStr
+	}
+
+	// Add default if present
+	if p.Property.Default != "" {
+		desc += " (default: " + p.Property.Default + ")"
+	}
+
+	// Add read-only indicator
+	if p.Property.ReadOnly {
+		desc += " (read-only)"
+	}
+
+	return desc
+}
+
 // cleanDescription sanitizes a description for use in Go struct tags.
 func cleanDescription(desc string) string {
 	desc = strings.ReplaceAll(desc, "\n", " ")
@@ -240,13 +394,16 @@ func exportedName(s string) string {
 }
 
 func paramGoType(p *Parameter) string {
+	optional := !p.Required
 	if p.Repeated {
-		return "[]" + scalarGoType(p.Type, p.Format)
+		return "[]" + scalarGoType(p.Type, p.Format, false) // array elements aren't optional
 	}
-	return scalarGoType(p.Type, p.Format)
+	return scalarGoType(p.Type, p.Format, optional)
 }
 
-func scalarGoType(typ, format string) string {
+// scalarGoType returns the Go type for a scalar Discovery Document type.
+// If optional is true and it's a boolean, returns *bool to distinguish absent from false.
+func scalarGoType(typ, format string, optional bool) string {
 	switch typ {
 	case "string":
 		return "string"
@@ -273,6 +430,9 @@ func scalarGoType(typ, format string) string {
 			return "float64"
 		}
 	case "boolean":
+		if optional {
+			return "*bool"
+		}
 		return "bool"
 	case "any":
 		return "any"
@@ -290,12 +450,103 @@ func indexOf(slice []string, s string) int {
 	return -1
 }
 
-var codeTemplate = template.Must(template.New("mcp").Parse(`// Code generated by discovery-to-mcp. DO NOT EDIT.
+// collectSchemas collects all schemas needed by the given methods, including dependencies.
+// Returns schemas in dependency order (dependencies first).
+func collectSchemas(methods []*MethodInfo, allSchemas map[string]*Schema) []*SchemaInfo {
+	needed := make(map[string]bool)
+
+	// Find all directly referenced schemas
+	for _, m := range methods {
+		if m.Method.Request != nil && m.Method.Request.Ref != "" {
+			collectSchemaRefs(m.Method.Request.Ref, allSchemas, needed)
+		}
+		if m.Method.Response != nil && m.Method.Response.Ref != "" {
+			collectSchemaRefs(m.Method.Response.Ref, allSchemas, needed)
+		}
+	}
+
+	// Convert to SchemaInfo list, sorted by name for deterministic output
+	var names []string
+	for name := range needed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var result []*SchemaInfo
+	for _, name := range names {
+		if schema, ok := allSchemas[name]; ok {
+			result = append(result, NewSchemaInfo(name, schema, allSchemas))
+		}
+	}
+
+	return result
+}
+
+// collectSchemaRefs recursively collects a schema and all its dependencies.
+func collectSchemaRefs(schemaName string, allSchemas map[string]*Schema, needed map[string]bool) {
+	if needed[schemaName] {
+		return // Already collected
+	}
+
+	schema, ok := allSchemas[schemaName]
+	if !ok {
+		return // Schema not found
+	}
+
+	needed[schemaName] = true
+
+	// Collect property references
+	for _, prop := range schema.Properties {
+		collectSchemaRefsFromSchema(prop, allSchemas, needed)
+	}
+
+	// Collect items references (for arrays)
+	if schema.Items != nil {
+		collectSchemaRefsFromSchema(schema.Items, allSchemas, needed)
+	}
+
+	// Collect additionalProperties references (for maps)
+	if schema.AdditionalProperties != nil {
+		collectSchemaRefsFromSchema(schema.AdditionalProperties, allSchemas, needed)
+	}
+}
+
+// collectSchemaRefsFromSchema collects schema references from a schema definition.
+func collectSchemaRefsFromSchema(schema *Schema, allSchemas map[string]*Schema, needed map[string]bool) {
+	if schema.Ref != "" {
+		collectSchemaRefs(schema.Ref, allSchemas, needed)
+	}
+	for _, prop := range schema.Properties {
+		collectSchemaRefsFromSchema(prop, allSchemas, needed)
+	}
+	if schema.Items != nil {
+		collectSchemaRefsFromSchema(schema.Items, allSchemas, needed)
+	}
+	if schema.AdditionalProperties != nil {
+		collectSchemaRefsFromSchema(schema.AdditionalProperties, allSchemas, needed)
+	}
+}
+
+var codeTemplate = template.Must(template.New("mcp").Parse(`// Code generated by google-discovery-mcp. DO NOT EDIT.
 // Source: {{.APIName}} {{.APIVersion}}
 // API: {{.APITitle}}
 
 package {{.PackageName}}
-
+{{if .GenerateSchema}}
+// =============================================================================
+// Schema Types (Request/Response Bodies)
+// =============================================================================
+{{range .SchemasToGen}}
+// {{.StructName}} - {{.Description}}
+type {{.StructName}} struct {
+{{- range .SortedProperties}}
+	{{.FieldName}} {{.GoType}} ` + "`" + `json:"{{.JSONTag}}" jsonschema:"{{.SchemaDescription}}"` + "`" + `
+{{- end}}
+}
+{{end}}{{end}}
+// =============================================================================
+// Tool Argument Types (URL Parameters)
+// =============================================================================
 {{range .Methods}}
 // {{.StructName}} are the arguments for {{.ToolName}}.
 // {{.Description}}

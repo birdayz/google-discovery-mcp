@@ -5,9 +5,11 @@
 //	google-discovery-mcp -api youtube -version v3                    # Fetch from Google
 //	google-discovery-mcp -file youtube-v3.json                       # Use local file
 //	google-discovery-mcp -api youtube -version v3 -methods videos.list,videos.insert
+//	google-discovery-mcp -api youtube -version v3 -schema            # Include schema types
 //	google-discovery-mcp -list                                       # List all Google APIs
 //
 // The tool generates Go structs with jsonschema tags suitable for MCP servers.
+// Use -schema to also generate types for request/response body schemas.
 package main
 
 import (
@@ -21,16 +23,17 @@ import (
 
 func main() {
 	var (
-		apiName      = flag.String("api", "", "API name (e.g., youtube, drive, gmail)")
-		version      = flag.String("version", "", "API version (e.g., v3, v1)")
-		file         = flag.String("file", "", "Path to local Discovery Document JSON file")
-		methods      = flag.String("methods", "", "Comma-separated list of methods to generate (default: all)")
-		pkg          = flag.String("package", "tools", "Go package name for generated code")
-		prefix       = flag.String("prefix", "", "Tool name prefix (default: {api}_)")
-		structPrefix = flag.String("struct-prefix", "API", "Struct name prefix (default: API)")
-		output       = flag.String("output", "", "Output file (default: stdout)")
-		listAPIs     = flag.Bool("list", false, "List all available Google APIs")
-		listMethods  = flag.Bool("list-methods", false, "List all methods in the API")
+		apiName        = flag.String("api", "", "API name (e.g., youtube, drive, gmail)")
+		version        = flag.String("version", "", "API version (e.g., v3, v1)")
+		file           = flag.String("file", "", "Path to local Discovery Document JSON file")
+		methods        = flag.String("methods", "", "Comma-separated list of methods to generate (default: all)")
+		pkg            = flag.String("package", "tools", "Go package name for generated code")
+		prefix         = flag.String("prefix", "", "Tool name prefix (default: {api}_)")
+		structPrefix   = flag.String("struct-prefix", "API", "Struct name prefix (default: API)")
+		output         = flag.String("output", "", "Output file (default: stdout)")
+		listAPIs       = flag.Bool("list", false, "List all available Google APIs")
+		listMethods    = flag.Bool("list-methods", false, "List all methods in the API")
+		generateSchema = flag.Bool("schema", false, "Generate schema types (request/response bodies)")
 	)
 	flag.Parse()
 
@@ -85,9 +88,10 @@ func main() {
 
 	// Generate code
 	opts := discovery.GenerateOptions{
-		PackageName:  *pkg,
-		Prefix:       *prefix,
-		StructPrefix: *structPrefix,
+		PackageName:    *pkg,
+		Prefix:         *prefix,
+		StructPrefix:   *structPrefix,
+		GenerateSchema: *generateSchema,
 	}
 	if *methods != "" {
 		opts.Methods = strings.Split(*methods, ",")
