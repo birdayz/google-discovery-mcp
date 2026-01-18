@@ -191,7 +191,7 @@ func (p *ParamInfo) SchemaDescription() string {
 	// Add enum values to description if present
 	if len(p.Param.Enum) > 0 {
 		enumStr := strings.Join(p.Param.Enum, ", ")
-		if len(desc) > 0 {
+		if desc != "" {
 			desc += " "
 		}
 		desc += "Values: " + enumStr
@@ -327,7 +327,7 @@ func (p *PropertyInfo) SchemaDescription() string {
 	// Add enum values to description if present
 	if len(p.Property.Enum) > 0 {
 		enumStr := strings.Join(p.Property.Enum, ", ")
-		if len(desc) > 0 {
+		if desc != "" {
 			desc += " "
 		}
 		desc += "Values: " + enumStr
@@ -371,7 +371,7 @@ func exportedName(s string) string {
 
 	words := strings.Fields(s)
 	for i, w := range words {
-		if len(w) > 0 {
+		if w != "" {
 			words[i] = strings.ToUpper(w[:1]) + w[1:]
 		}
 	}
@@ -384,7 +384,7 @@ func exportedName(s string) string {
 	result = strings.ReplaceAll(result, "Api", "API")
 
 	// Ensure first char is uppercase
-	if len(result) > 0 {
+	if result != "" {
 		runes := []rune(result)
 		runes[0] = unicode.ToUpper(runes[0])
 		result = string(runes)
@@ -403,12 +403,12 @@ func paramGoType(p *Parameter) string {
 
 // scalarGoType returns the Go type for a scalar Discovery Document type.
 // If optional is true and it's a boolean, returns *bool to distinguish absent from false.
-func scalarGoType(typ, format string, optional bool) string {
+func scalarGoType(typ, typeFormat string, optional bool) string {
 	switch typ {
 	case "string":
 		return "string"
 	case "integer":
-		switch format {
+		switch typeFormat {
 		case "int32":
 			return "int32"
 		case "uint32":
@@ -421,7 +421,7 @@ func scalarGoType(typ, format string, optional bool) string {
 			return "int64"
 		}
 	case "number":
-		switch format {
+		switch typeFormat {
 		case "float":
 			return "float32"
 		case "double":
